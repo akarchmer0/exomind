@@ -241,6 +241,32 @@ def evaluate_sidecar_val_loss(trainer, val_loader):
     return total_val_loss / total_samples if total_samples > 0 else 0
 
 
+def get_top_spurious_indices(features, v, percentile=1):
+    """
+    Returns indices of samples that score in the top percentile on the spurious direction v.
+    
+    Args:
+        features: Tensor of shape (N, D).
+        v: Direction tensor of shape (D,).
+        percentile: Top percentile to select (default 1 = top 1%).
+        
+    Returns:
+        indices: Tensor of indices for top scoring samples.
+    """
+    # Project features onto v
+    v_normalized = v / torch.norm(v)
+    projections = torch.matmul(features, v_normalized)
+    
+    # Find threshold for top percentile
+    k = max(1, int(len(projections) * percentile / 100))
+    threshold = torch.topk(projections, k).values[-1]
+    
+    # Get indices above threshold
+    indices = (projections >= threshold).nonzero(as_tuple=True)[0]
+    
+    return indices
+
+
 def main():
     # Hyperparameters
     num_samples = 10000  # Number of samples for training
@@ -518,6 +544,49 @@ def main():
     print(f"Change in Sensitivity: {final_sensitivity - baseline_sensitivity:+.4f}")
 
     # =========================================================================
+    # TOP 1% SPURIOUS SUBSET EVALUATION
+    # =========================================================================
+    print("\n" + "="*60)
+    print("  TOP 1% SPURIOUS SUBSET EVALUATION")
+    print("="*60)
+    
+    # Get indices of top 1% samples scoring highest on spurious direction v
+    top_spurious_indices = get_top_spurious_indices(val_features, v, percentile=1)
+    print(f"Evaluating on {len(top_spurious_indices)} samples (top 1% on spurious direction)")
+    
+    # Create subset dataset and loader for top spurious samples
+    top_spurious_features = val_features[top_spurious_indices]
+    top_spurious_labels = val_labels[top_spurious_indices]
+    top_spurious_dataset = Subset(val_dataset, top_spurious_indices.tolist())
+    top_spurious_injector_dataset = InjectorDataset(top_spurious_dataset, top_spurious_features, top_spurious_labels, processor)
+    top_spurious_loader = DataLoader(top_spurious_injector_dataset, batch_size=batch_size, shuffle=False, num_workers=4)
+    
+    # Baseline evaluation on top spurious subset
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    prediction_head.eval()
+    top_spurious_features_dev = top_spurious_features.to(device)
+    top_spurious_labels_dev = top_spurious_labels.to(device)
+    
+    criterion = torch.nn.CrossEntropyLoss()
+    with torch.no_grad():
+        logits = prediction_head(top_spurious_features_dev)
+        top_base_loss = criterion(logits, top_spurious_labels_dev).item()
+        _, predicted = torch.max(logits, 1)
+        top_base_acc = (predicted == top_spurious_labels_dev).sum().item() / len(top_spurious_labels_dev)
+    
+    print(f"Baseline - Top 1% Loss: {top_base_loss:.4f}, Acc: {top_base_acc*100:.2f}%")
+    
+    # No Penalty sidecar on top spurious subset
+    top_no_penalty_acc = trainer_no_penalty.evaluate(top_spurious_loader)
+    top_no_penalty_loss = evaluate_sidecar_val_loss(trainer_no_penalty, top_spurious_loader)
+    print(f"No Penalty - Top 1% Loss: {top_no_penalty_loss:.4f}, Acc: {top_no_penalty_acc*100:.2f}%")
+    
+    # With Penalty sidecar on top spurious subset
+    top_final_acc = trainer.evaluate(top_spurious_loader)
+    top_final_loss = evaluate_sidecar_val_loss(trainer, top_spurious_loader)
+    print(f"With Penalty - Top 1% Loss: {top_final_loss:.4f}, Acc: {top_final_acc*100:.2f}%")
+
+    # =========================================================================
     # SUMMARY COMPARISON
     # =========================================================================
     print("\n" + "="*60)
@@ -528,6 +597,9 @@ def main():
     print(f"{'Val Loss':<30} {base_loss:<15.4f} {no_penalty_loss:<15.4f} {final_loss:<15.4f}")
     print(f"{'Val Accuracy (%)':<30} {base_acc*100:<15.2f} {no_penalty_acc*100:<15.2f} {final_acc*100:<15.2f}")
     print(f"{'Sensitivity to v':<30} {baseline_sensitivity:<15.4f} {no_penalty_sensitivity:<15.4f} {final_sensitivity:<15.4f}")
+    print("-"*75)
+    print(f"{'Top 1% Val Loss':<30} {top_base_loss:<15.4f} {top_no_penalty_loss:<15.4f} {top_final_loss:<15.4f}")
+    print(f"{'Top 1% Val Accuracy (%)':<30} {top_base_acc*100:<15.2f} {top_no_penalty_acc*100:<15.2f} {top_final_acc*100:<15.2f}")
     print("="*60)
 
 
