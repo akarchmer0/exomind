@@ -63,10 +63,81 @@ class InjectorDataset(Dataset):
         return img_tensor, self.features[idx], self.labels[idx]
 
 
-def compute_similarity_matrix(loss_pls, conf_pls):
+def align_component_signs(loss_pls, conf_pls, features, labels, prediction_head):
+    """
+    Aligns the signs of PLS components so that positive projection = increasing target.
+    For Loss components: positive projection should mean HIGHER loss.
+    For Confidence components: positive projection should mean HIGHER confidence (lower entropy).
+    
+    Returns:
+        loss_signs: Array of +1 or -1 for each loss component.
+        conf_signs: Array of +1 or -1 for each confidence component.
+    """
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    features_dev = features.to(device)
+    labels_dev = labels.to(device)
+    prediction_head.eval()
+    
+    loss_comps = loss_pls.get_components()
+    conf_comps = conf_pls.get_components()
+    
+    n_loss = loss_comps.shape[1]
+    n_conf = conf_comps.shape[1]
+    
+    with torch.no_grad():
+        # Compute actual losses
+        logits = prediction_head(features_dev)
+        criterion = torch.nn.CrossEntropyLoss(reduction='none')
+        losses = criterion(logits, labels_dev).cpu().numpy()
+        
+        # Compute confidence (negative entropy)
+        probs = torch.softmax(logits, dim=1)
+        entropy = -torch.sum(probs * torch.log(probs + 1e-9), dim=1)
+        confidence = -entropy.cpu().numpy()  # Higher = more confident
+    
+    features_np = features.cpu().numpy()
+    
+    # Determine sign for each Loss component
+    loss_signs = np.ones(n_loss)
+    print("\nAligning Loss component signs:")
+    for i in range(n_loss):
+        vec = loss_comps[:, i]
+        vec = vec / np.linalg.norm(vec)
+        projections = features_np @ vec
+        corr = np.corrcoef(projections, losses)[0, 1]
+        if corr < 0:
+            loss_signs[i] = -1
+            print(f"  L{i+1}: corr={corr:+.4f} -> FLIP")
+        else:
+            print(f"  L{i+1}: corr={corr:+.4f} -> OK")
+    
+    # Determine sign for each Confidence component
+    conf_signs = np.ones(n_conf)
+    print("\nAligning Confidence component signs:")
+    for i in range(n_conf):
+        vec = conf_comps[:, i]
+        vec = vec / np.linalg.norm(vec)
+        projections = features_np @ vec
+        corr = np.corrcoef(projections, confidence)[0, 1]
+        if corr < 0:
+            conf_signs[i] = -1
+            print(f"  C{i+1}: corr={corr:+.4f} -> FLIP")
+        else:
+            print(f"  C{i+1}: corr={corr:+.4f} -> OK")
+    
+    return loss_signs, conf_signs
+
+
+def compute_similarity_matrix(loss_pls, conf_pls, loss_signs=None, conf_signs=None):
     """Computes cosine similarity between loss and confidence components."""
     loss_comps = loss_pls.get_components()
     conf_comps = conf_pls.get_components()
+    
+    # Apply signs if provided
+    if loss_signs is not None:
+        loss_comps = loss_comps * loss_signs
+    if conf_signs is not None:
+        conf_comps = conf_comps * conf_signs
     
     # Normalize
     loss_comps_norm = loss_comps / np.linalg.norm(loss_comps, axis=0, keepdims=True)
@@ -118,16 +189,16 @@ def get_user_selection(similarity):
             print("Please enter valid integers.")
 
 
-def compute_spurious_direction(loss_pls, conf_pls, loss_idx, conf_idx):
+def compute_spurious_direction(loss_pls, conf_pls, loss_idx, conf_idx, loss_signs, conf_signs):
     """
-    Computes the spurious direction v as the sum of normalized components.
+    Computes the spurious direction v as the sum of sign-corrected normalized components.
     """
     loss_comps = loss_pls.get_components()
     conf_comps = conf_pls.get_components()
     
-    # Get selected components
-    loss_vec = loss_comps[:, loss_idx]
-    conf_vec = conf_comps[:, conf_idx]
+    # Get selected components and apply the correct sign
+    loss_vec = loss_comps[:, loss_idx] * loss_signs[loss_idx]
+    conf_vec = conf_comps[:, conf_idx] * conf_signs[conf_idx]
     
     # Normalize
     loss_vec = loss_vec / np.linalg.norm(loss_vec)
@@ -136,6 +207,12 @@ def compute_spurious_direction(loss_pls, conf_pls, loss_idx, conf_idx):
     # Sum and normalize
     v = loss_vec + conf_vec
     v = v / np.linalg.norm(v)
+    
+    print(f"\nSpurious direction v:")
+    print(f"  L{loss_idx+1} sign: {'+' if loss_signs[loss_idx] > 0 else '-'}")
+    print(f"  C{conf_idx+1} sign: {'+' if conf_signs[conf_idx] > 0 else '-'}")
+    print(f"  v = normalized(L{loss_idx+1} + C{conf_idx+1})")
+    print(f"  -> High projection on v = HIGH LOSS + HIGH CONFIDENCE (Confidently Wrong)")
     
     return torch.tensor(v, dtype=torch.float32)
 
@@ -359,13 +436,17 @@ def main():
     conf_pls = ConfidencePLS(features, labels, prediction_head)
     conf_pls.fit(n_components=n_components)
 
+    # Align component signs BEFORE computing similarity matrix
+    print("\n--- 6. Aligning Component Signs ---")
+    loss_signs, conf_signs = align_component_signs(loss_pls, conf_pls, features, labels, prediction_head)
+
     # --- Step 3: Interactive Selection ---
-    similarity = compute_similarity_matrix(loss_pls, conf_pls)
+    similarity = compute_similarity_matrix(loss_pls, conf_pls, loss_signs, conf_signs)
     print_similarity_matrix(similarity)
     
     loss_idx, conf_idx = get_user_selection(similarity)
     
-    v = compute_spurious_direction(loss_pls, conf_pls, loss_idx, conf_idx)
+    v = compute_spurious_direction(loss_pls, conf_pls, loss_idx, conf_idx, loss_signs, conf_signs)
     print(f"\nSpurious direction v computed (shape: {v.shape}).")
 
     # --- Baseline Sensitivity ---
