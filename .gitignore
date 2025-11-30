@@ -1,0 +1,115 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+pip-wheel-metadata/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual environments
+venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+.venv/
+
+# PyCharm
+.idea/
+
+# VS Code
+.vscode/
+
+# Jupyter Notebook
+.ipynb_checkpoints
+*.ipynb
+
+# Data and datasets
+data/
+*.h5
+*.hdf5
+*.csv
+*.tsv
+*.parquet
+
+# Models and checkpoints
+models/
+*.pth
+*.pt
+*.ckpt
+*.pkl
+*.pickle
+*.joblib
+
+# Figures and visualizations
+figures/
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.svg
+*.pdf
+
+# Results and logs
+results/
+logs/
+runs/
+*.log
+*.out
+*.err
+
+# Temporary files
+*.tmp
+*.temp
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Environment variables
+.env
+.env.local
+
+# Sensitive data
+*.key
+*.pem
+*.crt
+credentials.json
+secrets.json
+
+# Cursor/IDE specific
+.cursor/
+terminals/
+
+# Large files
+*.zip
+*.tar
+*.tar.gz
+*.rar
+*.7z
+
+# Cache
+.cache/
+*.cache
+
