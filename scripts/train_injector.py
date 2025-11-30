@@ -148,12 +148,13 @@ def compute_similarity_matrix(loss_pls, conf_pls, loss_signs=None, conf_signs=No
     return similarity
 
 
-def print_similarity_matrix(similarity):
+def print_similarity_matrix(similarity, class_label=None):
     """Pretty prints the similarity matrix."""
     n_loss, n_conf = similarity.shape
     
+    class_str = f" - Class {class_label}" if class_label is not None else ""
     print("\n" + "="*60)
-    print("Cosine Similarity Matrix (Loss vs Confidence Components)")
+    print(f"Cosine Similarity Matrix (Loss vs Confidence Components){class_str}")
     print("="*60)
     
     # Header
@@ -170,9 +171,10 @@ def print_similarity_matrix(similarity):
     print("="*60)
 
 
-def get_user_selection(similarity):
+def get_user_selection(similarity, class_label=None):
     """Prompts user to select loss and confidence component indices."""
-    print("\nPositive correlation = High Loss aligns with High Confidence (Confidently Wrong)")
+    class_str = f" (Class {class_label})" if class_label is not None else ""
+    print(f"\nPositive correlation = High Loss aligns with High Confidence (Confidently Wrong){class_str}")
     print("Select the pair representing the spurious direction to remove.\n")
     
     while True:
@@ -428,26 +430,83 @@ def main():
     print(f"Baseline Val Loss: {base_loss:.4f}")
     print(f"Baseline Val Acc:  {base_acc*100:.2f}%")
 
-    # --- Step 2: Global PLS Analysis ---
-    print("\n--- 5. Computing Global PLS Components ---")
-    loss_pls = LossPLS(features, labels, prediction_head)
-    loss_pls.fit(n_components=n_components)
+    # --- Step 2: Per-Class PLS Analysis ---
+    print("\n--- 5. Computing Per-Class PLS Components ---")
     
-    conf_pls = ConfidencePLS(features, labels, prediction_head)
-    conf_pls.fit(n_components=n_components)
+    unique_classes = torch.unique(labels).tolist()
+    pls_data = {}  # Store PLS models and signs for each class
+    
+    for c in unique_classes:
+        print(f"\n{'='*40}")
+        print(f"  CLASS {c}")
+        print(f"{'='*40}")
+        
+        # Filter data for this class
+        class_mask = (labels == c)
+        features_c = features[class_mask]
+        labels_c = labels[class_mask]
+        
+        print(f"Samples in Class {c}: {len(features_c)}")
+        
+        # Compute PLS for this class
+        loss_pls_c = LossPLS(features_c, labels_c, prediction_head)
+        loss_pls_c.fit(n_components=n_components)
+        
+        conf_pls_c = ConfidencePLS(features_c, labels_c, prediction_head)
+        conf_pls_c.fit(n_components=n_components)
+        
+        # Align component signs
+        print(f"\nAligning signs for Class {c}:")
+        loss_signs_c, conf_signs_c = align_component_signs(loss_pls_c, conf_pls_c, features_c, labels_c, prediction_head)
+        
+        # Compute similarity matrix
+        similarity_c = compute_similarity_matrix(loss_pls_c, conf_pls_c, loss_signs_c, conf_signs_c)
+        
+        # Store for later use
+        pls_data[c] = {
+            'loss_pls': loss_pls_c,
+            'conf_pls': conf_pls_c,
+            'loss_signs': loss_signs_c,
+            'conf_signs': conf_signs_c,
+            'similarity': similarity_c
+        }
 
-    # Align component signs BEFORE computing similarity matrix
-    print("\n--- 6. Aligning Component Signs ---")
-    loss_signs, conf_signs = align_component_signs(loss_pls, conf_pls, features, labels, prediction_head)
-
-    # --- Step 3: Interactive Selection ---
-    similarity = compute_similarity_matrix(loss_pls, conf_pls, loss_signs, conf_signs)
-    print_similarity_matrix(similarity)
+    # --- Step 3: Display All Similarity Matrices ---
+    print("\n" + "="*60)
+    print("  ALL SIMILARITY MATRICES")
+    print("="*60)
     
-    loss_idx, conf_idx = get_user_selection(similarity)
+    for c in unique_classes:
+        print_similarity_matrix(pls_data[c]['similarity'], class_label=c)
     
-    v = compute_spurious_direction(loss_pls, conf_pls, loss_idx, conf_idx, loss_signs, conf_signs)
-    print(f"\nSpurious direction v computed (shape: {v.shape}).")
+    # --- Step 4: Interactive Selection ---
+    print("\n" + "="*60)
+    print("  SELECT SPURIOUS DIRECTION")
+    print("="*60)
+    
+    while True:
+        try:
+            selected_class = int(input(f"\nSelect class to use for spurious direction ({unique_classes}): "))
+            if selected_class in unique_classes:
+                break
+            else:
+                print(f"Invalid class. Choose from {unique_classes}")
+        except ValueError:
+            print("Please enter a valid integer.")
+    
+    print(f"\nUsing Class {selected_class} PLS components.")
+    print_similarity_matrix(pls_data[selected_class]['similarity'], class_label=selected_class)
+    
+    loss_idx, conf_idx = get_user_selection(pls_data[selected_class]['similarity'], class_label=selected_class)
+    
+    v = compute_spurious_direction(
+        pls_data[selected_class]['loss_pls'],
+        pls_data[selected_class]['conf_pls'],
+        loss_idx, conf_idx,
+        pls_data[selected_class]['loss_signs'],
+        pls_data[selected_class]['conf_signs']
+    )
+    print(f"\nSpurious direction v computed from Class {selected_class} (shape: {v.shape}).")
 
     # --- Baseline Sensitivity ---
     print("\n--- Baseline Sensitivity to Direction v ---")
