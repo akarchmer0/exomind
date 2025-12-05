@@ -25,6 +25,10 @@ class PLSViz:
         Plots predicted target (from PLS) vs actual target (from prediction head).
         Calculates and displays R^2.
         Saves to figures/predicted_vs_actual_{target_name.lower()}.png.
+        
+        For CombinedPLS (2D target):
+        - X-axis: Actual = z_loss + z_conf (sum of z-scored loss and confidence)
+        - Y-axis: Predicted = PLS first component score (projection)
         """
         if self.pls.pls_model is None:
             raise ValueError(f"{type(self.pls).__name__} instance must be fitted before visualization.")
@@ -33,35 +37,60 @@ class PLSViz:
         X = self.pls.features.cpu().numpy()
         
         # Actual target (Y)
-        # We access the generic method _compute_target_vector
         if hasattr(self.pls, '_compute_target_vector'):
-            Y_actual = self.pls._compute_target_vector().flatten()
+            Y_actual = self.pls._compute_target_vector()
         elif hasattr(self.pls, '_compute_loss_vector'):
-             # Fallback for old LossPLS if not updated (though we updated it)
-             Y_actual = self.pls._compute_loss_vector().flatten()
+             Y_actual = self.pls._compute_loss_vector()
         else:
             raise AttributeError("PLS instance must implement _compute_target_vector")
         
-        # Predicted target (Y_hat)
-        # PLS predict returns shape (n_samples, n_targets)
-        Y_pred = self.pls.pls_model.predict(X).flatten()
-        
-        # Calculate R^2
-        r2 = r2_score(Y_actual, Y_pred)
-        
-        plt.figure(figsize=(10, 6))
-        plt.scatter(Y_actual, Y_pred, alpha=0.5, s=10)
-        
-        # Plot perfect prediction line
-        min_val = min(Y_actual.min(), Y_pred.min())
-        max_val = max(Y_actual.max(), Y_pred.max())
-        plt.plot([min_val, max_val], [min_val, max_val], 'r--', alpha=0.8, label='Perfect Prediction')
-        
-        plt.title(f'Predicted vs Actual {target_name} (R² = {r2:.4f})')
-        plt.xlabel(f'Actual {target_name}')
-        plt.ylabel(f'Predicted {target_name} (from PLS projection)')
-        plt.legend()
-        plt.grid(True, alpha=0.3)
+        # Check if this is a multivariate target (CombinedPLS)
+        if Y_actual.ndim == 2 and Y_actual.shape[1] == 2:
+            # CombinedPLS: Plot predicted sum vs actual sum
+            # X-axis: Actual = z_loss + z_conf (sum of z-scored loss and confidence)
+            # Y-axis: Predicted = predicted_z_loss + predicted_z_conf
+            
+            Y_actual_sum = Y_actual[:, 0] + Y_actual[:, 1]  # z_loss + z_conf
+            Y_pred = self.pls.pls_model.predict(X)  # Shape: (N, 2)
+            Y_pred_sum = Y_pred[:, 0] + Y_pred[:, 1]  # predicted_z_loss + predicted_z_conf
+            
+            # Compute R^2 between actual sum and predicted sum
+            r2 = r2_score(Y_actual_sum, Y_pred_sum)
+            
+            plt.figure(figsize=(10, 6))
+            plt.scatter(Y_actual_sum, Y_pred_sum, alpha=0.5, s=10)
+            
+            # Plot perfect prediction line
+            min_val = min(Y_actual_sum.min(), Y_pred_sum.min())
+            max_val = max(Y_actual_sum.max(), Y_pred_sum.max())
+            plt.plot([min_val, max_val], [min_val, max_val], 'r--', alpha=0.8, label='Perfect Prediction')
+            
+            plt.title(f'{target_name}: Predicted vs Actual (z_loss + z_conf)\n(R² = {r2:.4f})')
+            plt.xlabel('Actual: z_loss + z_conf (Higher = Confidently Wrong)')
+            plt.ylabel('Predicted: z_loss + z_conf')
+            plt.legend()
+            plt.grid(True, alpha=0.3)
+            
+        else:
+            # Single target (LossPLS or ConfidencePLS)
+            Y_pred = self.pls.pls_model.predict(X)
+            Y_actual = Y_actual.flatten()
+            Y_pred = Y_pred.flatten()
+            
+            r2 = r2_score(Y_actual, Y_pred)
+            
+            plt.figure(figsize=(10, 6))
+            plt.scatter(Y_actual, Y_pred, alpha=0.5, s=10)
+            
+            min_val = min(Y_actual.min(), Y_pred.min())
+            max_val = max(Y_actual.max(), Y_pred.max())
+            plt.plot([min_val, max_val], [min_val, max_val], 'r--', alpha=0.8, label='Perfect Prediction')
+            
+            plt.title(f'Predicted vs Actual {target_name} (R² = {r2:.4f})')
+            plt.xlabel(f'Actual {target_name}')
+            plt.ylabel(f'Predicted {target_name} (from PLS projection)')
+            plt.legend()
+            plt.grid(True, alpha=0.3)
         
         filename = f"predicted_vs_actual_{target_name.lower()}.png"
         save_path = os.path.join(self.output_dir, filename)

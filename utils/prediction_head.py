@@ -25,7 +25,7 @@ class MLPHead(nn.Module):
 
 def train_prediction_head(features, labels, hidden_dims=[256, 128], n_layers=None, 
                           batch_size=32, lr=1e-3, epochs=10, device=None,
-                          val_features=None, val_labels=None):
+                          val_features=None, val_labels=None, dropout_rate=0.2, weight_decay=1e-5):
     """
     Trains an MLP prediction head on the provided features and labels.
 
@@ -55,9 +55,10 @@ def train_prediction_head(features, labels, hidden_dims=[256, 128], n_layers=Non
     num_classes = len(torch.unique(labels))
     
     print(f"Training MLP Head: Input Dim={input_dim}, Hidden Dims={hidden_dims}, Classes={num_classes}")
+    print(f"  Dropout rate: {dropout_rate}, Weight decay: {weight_decay}")
 
-    model = MLPHead(input_dim, hidden_dims, num_classes).to(device)
-    optimizer = optim.Adam(model.parameters(), lr=lr)
+    model = MLPHead(input_dim, hidden_dims, num_classes, dropout_rate=dropout_rate).to(device)
+    optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
     criterion = nn.CrossEntropyLoss()
     
     # Ensure data is on the correct device or moved during iteration

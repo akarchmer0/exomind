@@ -1,12 +1,14 @@
 import sys
 import os
+import argparse
 import torch
 import torch.optim as optim
 from torch.utils.data import DataLoader, Dataset
 from transformers import AutoImageProcessor, AutoModel
-from torchvision.datasets import PCAM
+from datasets import load_dataset
 from torch.utils.data import Subset
 import numpy as np
+from sklearn.linear_model import LinearRegression
 
 # Add parent directory to path
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -15,7 +17,91 @@ from utils.feature_extraction import extract_features
 from utils.prediction_head import train_prediction_head
 from PLS.loss_pls import LossPLS
 from PLS.confidence_pls import ConfidencePLS
+from PLS.combined_pls import CombinedPLS
 from injector.sidecar import SidecarModel, InjectorTrainer
+from spurious_utils import SpuriousPCAM, RotationSpuriousPCAM
+
+
+def convert_chexpert_to_multiclass(dataset):
+    """
+    Converts CheXpert multilabel dataset to multiclass.
+    CheXpert has 14 pathologies. We convert to multiclass by:
+    - If "No Finding" is positive -> class 0
+    - Otherwise, assign to first positive pathology (classes 1-13)
+    - If no positive labels, assign to class 0 (No Finding)
+    
+    Returns a new dataset with 'image' and 'label' keys.
+    """
+    # CheXpert pathology names (in order) - try common variations
+    pathology_names = [
+        'No Finding', 'Enlarged Cardiomediastinum', 'Cardiomegaly', 
+        'Lung Opacity', 'Lung Lesion', 'Edema', 'Consolidation', 
+        'Pneumonia', 'Atelectasis', 'Pneumothorax', 'Pleural Effusion',
+        'Pleural Other', 'Fracture', 'Support Devices'
+    ]
+    
+    # Also try lowercase and snake_case variations
+    pathology_variations = []
+    for name in pathology_names:
+        variations = [
+            name,
+            name.lower(),
+            name.replace(' ', '_').lower(),
+            name.replace(' ', '_')
+        ]
+        pathology_variations.append(variations)
+    
+    def convert_labels(example):
+        # Get all label columns - try to find pathology columns
+        labels = []
+        no_finding_idx = 0
+        
+        # Check which columns exist in the dataset
+        available_cols = set(example.keys())
+        
+        # Try to match pathology names to columns
+        for i, path_variations in enumerate(pathology_variations):
+            found_col = None
+            for var in path_variations:
+                if var in available_cols:
+                    found_col = var
+                    break
+            
+            if found_col:
+                val = example[found_col]
+                # Handle NaN, -1 (uncertain), 0 (negative), 1 (positive)
+                # Convert to float first to handle NaN
+                try:
+                    val_float = float(val) if val is not None else 0.0
+                    if val_float == 1.0:  # Positive
+                        labels.append(1)
+                    else:
+                        labels.append(0)
+                except (ValueError, TypeError):
+                    labels.append(0)
+            else:
+                labels.append(0)
+        
+        # Convert to multiclass: No Finding (class 0) vs first pathology (classes 1-13)
+        if labels[no_finding_idx] == 1:  # No Finding is positive
+            class_label = 0
+        else:
+            # Find first positive pathology (skip index 0 which is No Finding)
+            found = False
+            for i in range(1, len(labels)):
+                if labels[i] == 1:
+                    class_label = i
+                    found = True
+                    break
+            if not found:
+                class_label = 0  # Default to No Finding if no positive labels
+        
+        return {'image': example['image'], 'label': class_label}
+    
+    # Apply conversion - keep only image and label columns
+    cols_to_remove = [col for col in dataset.column_names if col != 'image']
+    converted = dataset.map(convert_labels, remove_columns=cols_to_remove)
+    return converted
 
 
 class InjectorDataset(Dataset):
@@ -63,6 +149,41 @@ class InjectorDataset(Dataset):
         return img_tensor, self.features[idx], self.labels[idx]
 
 
+def compute_variance_explained(projections, target):
+    """
+    Computes R² (variance explained) for a component.
+    
+    Args:
+        projections: 1D array of projections onto component
+        target: 1D array of target values (loss or confidence)
+    
+    Returns:
+        r_squared: Variance explained (0-1)
+    """
+    # Fit linear regression: target ~ projections
+    # R² = 1 - (SS_res / SS_tot)
+    projections = projections.reshape(-1, 1)
+    target = target.reshape(-1, 1)
+    
+    # Compute mean of target
+    target_mean = np.mean(target)
+    
+    # Fit linear model
+    reg = LinearRegression()
+    reg.fit(projections, target)
+    target_pred = reg.predict(projections)
+    
+    # Compute R²
+    ss_res = np.sum((target - target_pred) ** 2)
+    ss_tot = np.sum((target - target_mean) ** 2)
+    
+    if ss_tot == 0:
+        return 0.0
+    
+    r_squared = 1 - (ss_res / ss_tot)
+    return r_squared
+
+
 def align_component_signs(loss_pls, conf_pls, features, labels, prediction_head):
     """
     Aligns the signs of PLS components so that positive projection = increasing target.
@@ -105,11 +226,15 @@ def align_component_signs(loss_pls, conf_pls, features, labels, prediction_head)
         vec = vec / np.linalg.norm(vec)
         projections = features_np @ vec
         corr = np.corrcoef(projections, losses)[0, 1]
+        
+        # Compute variance explained
+        var_explained = compute_variance_explained(projections, losses)
+        
         if corr < 0:
             loss_signs[i] = -1
-            print(f"  L{i+1}: corr={corr:+.4f} -> FLIP")
+            print(f"  L{i+1}: corr={corr:+.4f}, var_explained={var_explained:.4f} ({var_explained*100:.2f}%) -> FLIP")
         else:
-            print(f"  L{i+1}: corr={corr:+.4f} -> OK")
+            print(f"  L{i+1}: corr={corr:+.4f}, var_explained={var_explained:.4f} ({var_explained*100:.2f}%) -> OK")
     
     # Determine sign for each Confidence component
     conf_signs = np.ones(n_conf)
@@ -119,11 +244,15 @@ def align_component_signs(loss_pls, conf_pls, features, labels, prediction_head)
         vec = vec / np.linalg.norm(vec)
         projections = features_np @ vec
         corr = np.corrcoef(projections, confidence)[0, 1]
+        
+        # Compute variance explained
+        var_explained = compute_variance_explained(projections, confidence)
+        
         if corr < 0:
             conf_signs[i] = -1
-            print(f"  C{i+1}: corr={corr:+.4f} -> FLIP")
+            print(f"  C{i+1}: corr={corr:+.4f}, var_explained={var_explained:.4f} ({var_explained*100:.2f}%) -> FLIP")
         else:
-            print(f"  C{i+1}: corr={corr:+.4f} -> OK")
+            print(f"  C{i+1}: corr={corr:+.4f}, var_explained={var_explained:.4f} ({var_explained*100:.2f}%) -> OK")
     
     return loss_signs, conf_signs
 
@@ -206,15 +335,14 @@ def compute_spurious_direction(loss_pls, conf_pls, loss_idx, conf_idx, loss_sign
     loss_vec = loss_vec / np.linalg.norm(loss_vec)
     conf_vec = conf_vec / np.linalg.norm(conf_vec)
     
-    # Sum and normalize
+    # Compute spurious direction v as the sum of the selected components
     v = loss_vec + conf_vec
+    # Normalize
     v = v / np.linalg.norm(v)
     
     print(f"\nSpurious direction v:")
     print(f"  L{loss_idx+1} sign: {'+' if loss_signs[loss_idx] > 0 else '-'}")
     print(f"  C{conf_idx+1} sign: {'+' if conf_signs[conf_idx] > 0 else '-'}")
-    print(f"  v = normalized(L{loss_idx+1} + C{conf_idx+1})")
-    print(f"  -> High projection on v = HIGH LOSS + HIGH CONFIDENCE (Confidently Wrong)")
     
     return torch.tensor(v, dtype=torch.float32)
 
@@ -346,7 +474,7 @@ def get_top_spurious_indices(features, v, percentile=1):
     return indices
 
 
-def main():
+def main(args):
     # Hyperparameters
     num_samples = 10000  # Number of samples for training
     n_components = 5
@@ -354,10 +482,11 @@ def main():
     batch_size = 64
     lr = 1e-4
     lambda_val = 1.0  # Scaling for spurious direction
-    alpha_penalty = 1.0  # Weight for invariance penalty
+    alpha_penalty = 0.5  # Weight for invariance penalty
     
     print("="*60)
     print("  SIDECAR INJECTOR TRAINING")
+    print(f"  Dataset: {args.dataset}")
     print("="*60)
     
     # --- Step 1: Setup ---
@@ -370,21 +499,111 @@ def main():
         print(f"Error loading Phikon: {e}")
         return
 
-    print("\n--- 2. Loading PatchCamelyon Dataset ---")
+    print("\n--- 2. Loading Dataset ---")
     try:
-        data_root = os.path.join(os.path.dirname(__file__), '..', 'data')
-        os.makedirs(data_root, exist_ok=True)
-        
-        full_dataset = PCAM(root=data_root, split='train', download=True)
-        
-        # Training subset
-        indices = torch.arange(num_samples)
-        dataset = Subset(full_dataset, indices)
-        
-        # Validation subset
-        val_samples = 10000
-        val_indices = torch.arange(num_samples, num_samples + val_samples)
-        val_dataset = Subset(full_dataset, val_indices)
+        if args.dataset == 'chexpert':
+            # Load CheXpert from HuggingFace
+            print("Loading CheXpert from HuggingFace datasets...")
+            try:
+                # Load CheXpert dataset
+                full_dataset = load_dataset("danjacobellis/chexpert", split='train')
+                print(f"Loaded {len(full_dataset)} samples from CheXpert.")
+                
+                # Convert multilabel to multiclass
+                print("Converting multilabel to multiclass...")
+                full_dataset = convert_chexpert_to_multiclass(full_dataset)
+                
+                # CheXpert is large, use reasonable sample sizes
+                chexpert_num_samples = min(100000, len(full_dataset))  # Use up to 50k samples
+                chexpert_val_samples = min(20000, len(full_dataset) - chexpert_num_samples)
+                
+                indices = list(range(chexpert_num_samples))
+                train_subset = full_dataset.select(indices)
+                
+                val_indices = list(range(chexpert_num_samples, chexpert_num_samples + chexpert_val_samples))
+                val_subset = full_dataset.select(val_indices)
+                
+                dataset = train_subset
+                val_dataset = val_subset
+                print(f"Using CheXpert dataset (14 classes: No Finding + 13 pathologies).")
+                print(f"  Classes: 0=No Finding, 1-13=Pathologies (Enlarged Cardiomediastinum, Cardiomegaly, etc.)")
+            except Exception as e:
+                print(f"Error loading CheXpert dataset: {e}")
+                print("Note: CheXpert dataset may require additional setup.")
+                raise
+        elif args.dataset == 'kather':
+            # Load Kather100K (NCT-CRC-HE-100K) from HuggingFace
+            print("Loading Kather100K (NCT-CRC-HE-100K) from HuggingFace datasets...")
+            try:
+                # Try loading from HuggingFace - common dataset names
+                # Option 1: Direct HuggingFace dataset if available
+                try:
+                    full_dataset = load_dataset("timm/NCT-CRC-HE-100K", split='train')
+                except:
+                    # Option 2: ImageFolder format (requires local path)
+                    data_root = os.path.join(os.path.dirname(__file__), '..', 'data', 'NCT-CRC-HE-100K')
+                    if os.path.exists(data_root):
+                        full_dataset = load_dataset("imagefolder", data_dir=data_root, split='train')
+                    else:
+                        raise ValueError(f"Kather dataset not found at {data_root}. Please download NCT-CRC-HE-100K dataset.")
+            except Exception as e:
+                print(f"Error loading Kather dataset: {e}")
+                print("Note: Kather dataset may need to be downloaded separately.")
+                print("Please download NCT-CRC-HE-100K and place it in data/NCT-CRC-HE-100K/")
+                raise
+            
+            # Kather has 9 classes, use more samples for multiclass
+            kather_num_samples = min(50000, len(full_dataset))  # Use up to 50k samples
+            kather_val_samples = min(10000, len(full_dataset) - kather_num_samples)
+            
+            indices = list(range(kather_num_samples))
+            train_subset = full_dataset.select(indices)
+            
+            val_indices = list(range(kather_num_samples, kather_num_samples + kather_val_samples))
+            val_subset = full_dataset.select(val_indices)
+            
+            dataset = train_subset
+            val_dataset = val_subset
+            print(f"Using Kather100K dataset (9 tissue classes).")
+            print(f"  Classes: 0-8 (Adipose, Background, Debris, Lymphocytes, Mucus, Smooth muscle, Normal colon, Cancer-associated stroma, Cancer epithelium)")
+        else:
+            # Load PCAM from HuggingFace (avoids Google Drive rate limits)
+            print("Loading PCAM from HuggingFace datasets...")
+            full_dataset = load_dataset("1aurent/PatchCamelyon", split='train')
+            
+            # Training subset
+            indices = list(range(num_samples))
+            train_subset = full_dataset.select(indices)
+            
+            # Validation subset
+            val_samples = 2000
+            val_indices = list(range(num_samples, num_samples + val_samples))
+            val_subset = full_dataset.select(val_indices)
+            
+            # Wrap with spurious correlation dataset if specified
+            # Note: HuggingFace datasets return dicts with 'image' and 'label' keys
+            if args.dataset == 'normal':
+                dataset = train_subset
+                val_dataset = val_subset
+                print("Using normal (unmodified) PCAM dataset.")
+            elif args.dataset == 'spurious':
+                artifact_probs = {0: 0.0, 1: 0.9}
+                # Training: Black square only on positive class (spurious correlation)
+                dataset = SpuriousPCAM(train_subset, artifact_probs=artifact_probs, square_size=30)
+                # Validation: Black square on both classes (balanced, no correlation)
+                val_dataset = SpuriousPCAM(val_subset, artifact_probs=artifact_probs, square_size=30)
+                print("Using SpuriousPCAM (black square artifact).")
+                print(f"  Training: artifact on {artifact_probs[1]*100}% of positive class only.")
+                print(f"  Validation: artifact on {artifact_probs[0]*100}% of both classes (balanced).")
+            elif args.dataset == 'rotation':
+                artifact_probs = {0: 0.0, 1: 0.9}
+                # Training: Rotation only on positive class (spurious correlation)  
+                dataset = RotationSpuriousPCAM(train_subset, artifact_probs=artifact_probs)
+                # Validation: Rotation on both classes (balanced, no correlation)
+                val_dataset = RotationSpuriousPCAM(val_subset, artifact_probs=artifact_probs)
+                print("Using RotationSpuriousPCAM (90-degree rotation artifact).")
+                print(f"  Training: artifact on {artifact_probs[1]*100}% of positive class only.")
+                print(f"  Validation: artifact on {artifact_probs[0]*100}% of both classes (balanced).")
         
         print(f"Training samples: {len(dataset)}")
         print(f"Validation samples: {len(val_dataset)}")
@@ -406,11 +625,13 @@ def main():
     prediction_head = train_prediction_head(
         features=features,
         labels=labels,
-        hidden_dims=[256, 128],
-        epochs=10,
+        hidden_dims=[512, 256, 128],
+        epochs=20,
         batch_size=64,
         val_features=val_features,
-        val_labels=val_labels
+        val_labels=val_labels,
+        dropout_rate=0.2,
+        weight_decay=1e-5
     )
     print("Prediction head trained (best val loss saved).")
     
@@ -430,10 +651,11 @@ def main():
     print(f"Baseline Val Loss: {base_loss:.4f}")
     print(f"Baseline Val Acc:  {base_acc*100:.2f}%")
 
-    # --- Step 2: Per-Class PLS Analysis ---
-    print("\n--- 5. Computing Per-Class PLS Components ---")
+    # --- Step 2: Per-Class PLS Analysis (on Validation/Analysis Set) ---
+    print("\n--- 5. Computing Per-Class PLS Components (on Analysis Set) ---")
+    print("Note: PLS runs on validation set (balanced artifact) to detect model bias.")
     
-    unique_classes = torch.unique(labels).tolist()
+    unique_classes = torch.unique(val_labels).tolist()
     pls_data = {}  # Store PLS models and signs for each class
     
     for c in unique_classes:
@@ -441,10 +663,10 @@ def main():
         print(f"  CLASS {c}")
         print(f"{'='*40}")
         
-        # Filter data for this class
-        class_mask = (labels == c)
-        features_c = features[class_mask]
-        labels_c = labels[class_mask]
+        # Filter data for this class (using validation/analysis set)
+        class_mask = (val_labels == c)
+        features_c = val_features[class_mask]
+        labels_c = val_labels[class_mask]
         
         print(f"Samples in Class {c}: {len(features_c)}")
         
@@ -455,7 +677,12 @@ def main():
         conf_pls_c = ConfidencePLS(features_c, labels_c, prediction_head)
         conf_pls_c.fit(n_components=n_components)
         
-        # Align component signs
+        # Compute Combined PLS (multivariate on [loss, confidence])
+        combined_pls_c = CombinedPLS(features_c, labels_c, prediction_head)
+        combined_pls_c.fit(n_components=n_components)
+        combined_pls_c.print_component_stats(n_components=n_components)
+        
+        # Align component signs (for individual PLS visualization)
         print(f"\nAligning signs for Class {c}:")
         loss_signs_c, conf_signs_c = align_component_signs(loss_pls_c, conf_pls_c, features_c, labels_c, prediction_head)
         
@@ -466,6 +693,7 @@ def main():
         pls_data[c] = {
             'loss_pls': loss_pls_c,
             'conf_pls': conf_pls_c,
+            'combined_pls': combined_pls_c,
             'loss_signs': loss_signs_c,
             'conf_signs': conf_signs_c,
             'similarity': similarity_c
@@ -481,7 +709,7 @@ def main():
     
     # --- Step 4: Interactive Selection ---
     print("\n" + "="*60)
-    print("  SELECT SPURIOUS DIRECTION")
+    print("  SELECT SPURIOUS DIRECTION (via Combined PLS)")
     print("="*60)
     
     while True:
@@ -494,24 +722,146 @@ def main():
         except ValueError:
             print("Please enter a valid integer.")
     
-    print(f"\nUsing Class {selected_class} PLS components.")
+    print(f"\nUsing Class {selected_class} Combined PLS first component.")
+    
+    # Show similarity matrix for reference
     print_similarity_matrix(pls_data[selected_class]['similarity'], class_label=selected_class)
     
-    loss_idx, conf_idx = get_user_selection(pls_data[selected_class]['similarity'], class_label=selected_class)
+    # Get spurious direction from Combined PLS (first component)
+    combined_pls = pls_data[selected_class]['combined_pls']
+    combined_pls.print_component_stats(n_components=3)
     
-    v = compute_spurious_direction(
-        pls_data[selected_class]['loss_pls'],
-        pls_data[selected_class]['conf_pls'],
-        loss_idx, conf_idx,
-        pls_data[selected_class]['loss_signs'],
-        pls_data[selected_class]['conf_signs']
-    )
-    print(f"\nSpurious direction v computed from Class {selected_class} (shape: {v.shape}).")
+    # Determine sign and get direction
+    sign = combined_pls.align_sign()
+    v = combined_pls.get_spurious_direction(component_idx=0) * sign
+    
+    var_explained = combined_pls.get_variance_explained()
+    print(f"\nSpurious direction v (Combined PLS Component 1):")
+    print(f"  Sign applied: {'+' if sign > 0 else '-'}")
+    print(f"  Loss R²: {var_explained['loss'][0]:.4f} ({var_explained['loss'][0]*100:.2f}%)")
+    print(f"  Confidence R²: {var_explained['confidence'][0]:.4f} ({var_explained['confidence'][0]*100:.2f}%)")
+    print(f"  Shape: {v.shape}")
 
     # --- Baseline Sensitivity ---
     print("\n--- Baseline Sensitivity to Direction v ---")
     baseline_sensitivity = compute_sensitivity(prediction_head, val_features, v, lambda_val=lambda_val)
     print(f"Baseline Sensitivity (avg logit change): {baseline_sensitivity:.4f}")
+
+    # =========================================================================
+    # LINEAR CONCEPT ERASURE (If requested)
+    # =========================================================================
+    if args.use_linear_erasure:
+        print("\n" + "="*60)
+        print("  APPLYING LINEAR CONCEPT ERASURE")
+        print("="*60)
+        
+        # Project out the spurious direction v from all features
+        # h_clean = h - (h . v) * v
+        # Ensure v is normalized
+        v_norm = v / torch.norm(v)
+        v_norm = v_norm.to(features.device)
+        
+        # 1. Clean Training Features
+        print("Projecting out v from Training Features...")
+        # features: (N, D), v: (D) -> dot product per sample
+        projections_train = torch.matmul(features, v_norm) # (N,)
+        features_clean = features - projections_train.unsqueeze(1) * v_norm.unsqueeze(0)
+        
+        # 2. Clean Validation Features
+        print("Projecting out v from Validation Features...")
+        projections_val = torch.matmul(val_features, v_norm)
+        val_features_clean = val_features - projections_val.unsqueeze(1) * v_norm.unsqueeze(0)
+        
+        # 3. Retrain Prediction Head on Clean Features
+        print("\n--- Retraining Prediction Head on CLEANED Features ---")
+        prediction_head_clean = train_prediction_head(
+            features=features_clean,
+            labels=labels,
+            hidden_dims=[512, 256, 128],
+            epochs=epochs,
+            batch_size=batch_size,
+            val_features=val_features_clean,
+            val_labels=val_labels,
+            dropout_rate=0.2,
+            weight_decay=1e-5
+        )
+        
+        # 4. Evaluate Clean Head
+        print("\n--- Evaluation of Linear Erasure ---")
+        prediction_head_clean.eval()
+        val_features_clean_dev = val_features_clean.to("cuda" if torch.cuda.is_available() else "cpu")
+        val_labels_dev = val_labels.to("cuda" if torch.cuda.is_available() else "cpu")
+        
+        criterion = torch.nn.CrossEntropyLoss()
+        with torch.no_grad():
+            logits = prediction_head_clean(val_features_clean_dev)
+            clean_loss = criterion(logits, val_labels_dev).item()
+            _, predicted = torch.max(logits, 1)
+            clean_acc = (predicted == val_labels_dev).sum().item() / len(val_labels_dev)
+            
+        print(f"Linear Erasure Val Loss: {clean_loss:.4f}")
+        print(f"Linear Erasure Val Acc:  {clean_acc*100:.2f}%")
+        print(f"Change vs Baseline Acc:  {clean_acc*100 - base_acc*100:+.2f}%")
+        
+        # Sensitivity of Clean Head to v (should be 0)
+        # Note: perturbing cleaned features by v has no effect if v is orthogonal, 
+        # BUT here compute_sensitivity adds v to the input. 
+        # The clean head expects inputs orthogonal to v. 
+        # If we add v, and the first layer is linear, it might still react unless we explicitly project input in the model.
+        # However, if we retrained on data orthogonal to v, the weights W corresponding to v (W . v) should be 0 or random noise.
+        
+        clean_sensitivity = compute_sensitivity(prediction_head_clean, val_features_clean, v, lambda_val=lambda_val)
+        print(f"Sensitivity of Clean Head (retrained) to v: {clean_sensitivity:.4f}")
+        
+        # =========================================================================
+        # TOP 1% SPURIOUS SUBSET EVALUATION (Linear Erasure)
+        # =========================================================================
+        print("\n" + "="*60)
+        print("  TOP 1% SPURIOUS SUBSET EVALUATION")
+        print("="*60)
+        
+        # Get top 1% indices based on projection onto v (Combined PLS first component)
+        top_indices = get_top_spurious_indices(val_features, v, percentile=1)
+        print(f"Evaluating on {len(top_indices)} samples (top 1% on Combined PLS component)")
+        
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        
+        # Baseline on top 1%
+        top_features = val_features[top_indices].to(device)
+        top_labels = val_labels[top_indices].to(device)
+        with torch.no_grad():
+            logits = prediction_head(top_features)
+            top_base_loss = criterion(logits, top_labels).item()
+            _, predicted = torch.max(logits, 1)
+            top_base_acc = (predicted == top_labels).sum().item() / len(top_labels)
+        
+        print(f"Baseline - Top 1% Loss: {top_base_loss:.4f}, Acc: {top_base_acc*100:.2f}%")
+        
+        # Linear Erasure on top 1%
+        top_features_clean = val_features_clean[top_indices].to(device)
+        with torch.no_grad():
+            logits = prediction_head_clean(top_features_clean)
+            top_clean_loss = criterion(logits, top_labels).item()
+            _, predicted = torch.max(logits, 1)
+            top_clean_acc = (predicted == top_labels).sum().item() / len(top_labels)
+        
+        print(f"Linear Erasure - Top 1% Loss: {top_clean_loss:.4f}, Acc: {top_clean_acc*100:.2f}%")
+        print(f"Change in Top 1% Acc: {top_clean_acc*100 - top_base_acc*100:+.2f}%")
+        
+        # Summary
+        print("\n" + "="*60)
+        print("  SUMMARY (Linear Erasure)")
+        print("="*60)
+        print(f"{'Metric':<30} {'Baseline':<15} {'Linear Erasure':<15} {'Change':<15}")
+        print("-"*75)
+        print(f"{'Overall Val Loss':<30} {base_loss:<15.4f} {clean_loss:<15.4f} {clean_loss - base_loss:+.4f}")
+        print(f"{'Overall Val Acc (%)':<30} {base_acc*100:<15.2f} {clean_acc*100:<15.2f} {clean_acc*100 - base_acc*100:+.2f}")
+        print(f"{'Top 1% Val Loss':<30} {top_base_loss:<15.4f} {top_clean_loss:<15.4f} {top_clean_loss - top_base_loss:+.4f}")
+        print(f"{'Top 1% Val Acc (%)':<30} {top_base_acc*100:<15.2f} {top_clean_acc*100:<15.2f} {top_clean_acc*100 - top_base_acc*100:+.2f}")
+        print(f"{'Sensitivity to v':<30} {baseline_sensitivity:<15.4f} {clean_sensitivity:<15.4f} {clean_sensitivity - baseline_sensitivity:+.4f}")
+        print("="*60)
+        
+        return # Exit after linear erasure experiment
 
     # Prepare validation loader (shared by both sidecar versions)
     val_injector_dataset = InjectorDataset(val_dataset, val_features, val_labels, processor)
@@ -697,7 +1047,11 @@ def main():
     # Create subset dataset and loader for top spurious samples
     top_spurious_features = val_features[top_spurious_indices]
     top_spurious_labels = val_labels[top_spurious_indices]
-    top_spurious_dataset = Subset(val_dataset, top_spurious_indices.tolist())
+    # Use .select() for HuggingFace datasets, Subset for others
+    if hasattr(val_dataset, 'select'):
+        top_spurious_dataset = val_dataset.select(top_spurious_indices.tolist())
+    else:
+        top_spurious_dataset = Subset(val_dataset, top_spurious_indices.tolist())
     top_spurious_injector_dataset = InjectorDataset(top_spurious_dataset, top_spurious_features, top_spurious_labels, processor)
     top_spurious_loader = DataLoader(top_spurious_injector_dataset, batch_size=batch_size, shuffle=False, num_workers=4)
     
@@ -744,5 +1098,12 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(description="Train Sidecar Injector for Spurious Correlation Removal")
+    parser.add_argument('--dataset', type=str, default='normal',
+                        choices=['normal', 'spurious', 'rotation', 'kather', 'chexpert'],
+                        help='Dataset variant: normal, spurious (black square), rotation (90deg), kather (multiclass), chexpert (chest xray)')
+    parser.add_argument('--use-linear-erasure', action='store_true',
+                        help='Apply linear concept erasure (projection) to remove spurious direction')
+    args = parser.parse_args()
+    main(args)
 

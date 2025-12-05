@@ -1,6 +1,8 @@
 import torch
 from torch.utils.data import DataLoader
 from tqdm import tqdm
+from PIL import Image
+import numpy as np
 
 def extract_features(model, processor, dataset, device=None, batch_size=32):
     """
@@ -65,14 +67,38 @@ def extract_features(model, processor, dataset, device=None, batch_size=32):
         return torch.tensor([]), torch.tensor([])
         
     features_tensor = torch.cat(all_features, dim=0)
-    labels_tensor = torch.tensor(all_labels)
+    labels_tensor = torch.tensor(all_labels, dtype=torch.long)
 
     return features_tensor, labels_tensor
 
 def _process_batch(model, processor, images, labels, all_features, all_labels, device):
     """Helper to process a batch of images and labels."""
+    # Convert images to PIL Images if needed, and ensure RGB format
+    processed_images = []
+    for img in images:
+        # If it's a string path, load the image
+        if isinstance(img, str):
+            img = Image.open(img)
+        
+        # If it's a numpy array, convert to PIL Image
+        if isinstance(img, np.ndarray):
+            # Handle grayscale (2D) or RGB (3D) arrays
+            if img.ndim == 2:
+                img = Image.fromarray(img, mode='L').convert('RGB')
+            elif img.ndim == 3:
+                img = Image.fromarray(img)
+            else:
+                raise ValueError(f"Unsupported array shape: {img.shape}")
+        
+        # If it's already a PIL Image, ensure it's RGB
+        if isinstance(img, Image.Image):
+            if img.mode != 'RGB':
+                img = img.convert('RGB')
+        
+        processed_images.append(img)
+    
     # processor returns a dict with 'pixel_values'
-    inputs = processor(images=images, return_tensors="pt").to(device)
+    inputs = processor(images=processed_images, return_tensors="pt").to(device)
 
     with torch.no_grad():
         outputs = model(**inputs)

@@ -103,7 +103,7 @@ class InjectorTrainer:
             
             # Invariance penalty
             # Perturb embedding by removing lambda * v
-            h_perturbed = h_combined - lambda_val * self.v.unsqueeze(0)
+            h_perturbed = h_combined + lambda_val * self.v.unsqueeze(0)
             logits_perturbed = self.prediction_head(h_perturbed)
             
             # Penalize difference in logits
