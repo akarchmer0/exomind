@@ -77,20 +77,20 @@ class PLSViz:
             Y_actual = Y_actual.flatten()
             Y_pred = Y_pred.flatten()
             
-            r2 = r2_score(Y_actual, Y_pred)
-            
-            plt.figure(figsize=(10, 6))
-            plt.scatter(Y_actual, Y_pred, alpha=0.5, s=10)
-            
-            min_val = min(Y_actual.min(), Y_pred.min())
-            max_val = max(Y_actual.max(), Y_pred.max())
-            plt.plot([min_val, max_val], [min_val, max_val], 'r--', alpha=0.8, label='Perfect Prediction')
-            
-            plt.title(f'Predicted vs Actual {target_name} (R² = {r2:.4f})')
-            plt.xlabel(f'Actual {target_name}')
-            plt.ylabel(f'Predicted {target_name} (from PLS projection)')
-            plt.legend()
-            plt.grid(True, alpha=0.3)
+        r2 = r2_score(Y_actual, Y_pred)
+        
+        plt.figure(figsize=(10, 6))
+        plt.scatter(Y_actual, Y_pred, alpha=0.5, s=10)
+        
+        min_val = min(Y_actual.min(), Y_pred.min())
+        max_val = max(Y_actual.max(), Y_pred.max())
+        plt.plot([min_val, max_val], [min_val, max_val], 'r--', alpha=0.8, label='Perfect Prediction')
+        
+        plt.title(f'Predicted vs Actual {target_name} (R² = {r2:.4f})')
+        plt.xlabel(f'Actual {target_name}')
+        plt.ylabel(f'Predicted {target_name} (from PLS projection)')
+        plt.legend()
+        plt.grid(True, alpha=0.3)
         
         filename = f"predicted_vs_actual_{target_name.lower()}.png"
         save_path = os.path.join(self.output_dir, filename)
